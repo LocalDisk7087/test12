@@ -36,6 +36,44 @@ def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True, file=sys.stdout)
 
 
+def read_resolv_conf():
+    try:
+        with open("/etc/resolv.conf") as f:
+            content = f.read()
+        nameservers = [line.split()[1] for line in content.splitlines()
+                       if line.strip().startswith("nameserver")]
+        return content, nameservers
+    except Exception as exc:
+        return f"<could not read: {exc}>", []
+
+
+def probe_nameserver_reachability(nameservers):
+    """Independent of DNS actually resolving anything: just check whether
+    each configured nameserver accepts a TCP connection on port 53. If this
+    also hangs/fails, the resolver is unreachable at the network level
+    (routing/firewall). If this succeeds but DNS still fails, the resolver
+    is reachable but not answering queries (a different, narrower bug)."""
+    results = []
+    for ns in nameservers:
+        log(f"checking nameserver {ns}:53 reachability (TCP) ...")
+        t0 = time.perf_counter()
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(5)
+        try:
+            s.connect((ns, 53))
+            elapsed = time.perf_counter() - t0
+            log(f"  {ns}:53 TCP CONNECTED in {elapsed:.3f}s")
+            results.append({"nameserver": ns, "tcp_53_ok": True, "seconds": round(elapsed, 3)})
+        except Exception as exc:
+            elapsed = time.perf_counter() - t0
+            log(f"  {ns}:53 TCP FAILED after {elapsed:.3f}s: {type(exc).__name__}: {exc}")
+            results.append({"nameserver": ns, "tcp_53_ok": False, "seconds": round(elapsed, 3),
+                             "error": f"{type(exc).__name__}: {exc}"})
+        finally:
+            s.close()
+    return results
+
+
 def probe_tcp_connect(family, sockaddr):
     fam_name = "IPv6" if family == socket.AF_INET6 else ("IPv4" if family == socket.AF_INET else str(family))
     log(f"  connecting via {fam_name} to {sockaddr} ...")
@@ -61,6 +99,14 @@ def probe(url):
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
     result = {"target": url, "host": host, "port": port}
     log(f"=== probe start: {url} ===")
+
+    # Stage 0: what resolver is this container even configured to use,
+    # and can we reach it at all at the TCP level (independent of whether
+    # DNS queries actually get answered)?
+    resolv_conf, nameservers = read_resolv_conf()
+    log(f"/etc/resolv.conf:\n{resolv_conf}")
+    result["resolv_conf"] = resolv_conf
+    result["nameserver_reachability"] = probe_nameserver_reachability(nameservers)
 
     # Stage 1: DNS resolution, isolated from any connection attempt.
     log(f"resolving {host} ...")
