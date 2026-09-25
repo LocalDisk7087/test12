@@ -19,6 +19,7 @@ itself rather than at anything in this Python process.
 """
 import json
 import socket
+import sys
 import time
 import urllib.request
 import urllib.parse
@@ -28,16 +29,27 @@ DEFAULT_TARGET = "https://example.com"
 CONNECT_TIMEOUT = 20  # generous on purpose - we want to see it hang and time it, not cut it off early
 
 
+def log(msg):
+    """Print immediately, flushed, so this survives in the container's stdout
+    logs even if the platform's gateway kills the HTTP response before the
+    request finishes (which is exactly the failure mode we're chasing)."""
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True, file=sys.stdout)
+
+
 def probe_tcp_connect(family, sockaddr):
+    fam_name = "IPv6" if family == socket.AF_INET6 else ("IPv4" if family == socket.AF_INET else str(family))
+    log(f"  connecting via {fam_name} to {sockaddr} ...")
     t0 = time.perf_counter()
     s = socket.socket(family, socket.SOCK_STREAM)
     s.settimeout(CONNECT_TIMEOUT)
     try:
         s.connect(sockaddr)
         elapsed = time.perf_counter() - t0
+        log(f"  {fam_name} {sockaddr} CONNECTED in {elapsed:.3f}s")
         return {"ok": True, "seconds": round(elapsed, 3)}
     except Exception as exc:
         elapsed = time.perf_counter() - t0
+        log(f"  {fam_name} {sockaddr} FAILED after {elapsed:.3f}s: {type(exc).__name__}: {exc}")
         return {"ok": False, "seconds": round(elapsed, 3), "error": f"{type(exc).__name__}: {exc}"}
     finally:
         s.close()
@@ -48,15 +60,19 @@ def probe(url):
     host = parsed.hostname
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
     result = {"target": url, "host": host, "port": port}
+    log(f"=== probe start: {url} ===")
 
     # Stage 1: DNS resolution, isolated from any connection attempt.
+    log(f"resolving {host} ...")
     t0 = time.perf_counter()
     try:
         addrinfo = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
         result["dns_seconds"] = round(time.perf_counter() - t0, 3)
+        log(f"DNS resolved in {result['dns_seconds']}s")
     except Exception as exc:
         result["dns_seconds"] = round(time.perf_counter() - t0, 3)
         result["dns_error"] = f"{type(exc).__name__}: {exc}"
+        log(f"DNS FAILED after {result['dns_seconds']}s: {result['dns_error']}")
         return result
 
     # Dedup by (family, address) - getaddrinfo often repeats entries per socktype.
@@ -77,6 +93,7 @@ def probe(url):
         result["resolved"].append({"family": fam_name, "address": sockaddr[0], "connect": conn})
 
     # Stage 3: the actual full HTTPS/HTTP fetch, as the real app does it.
+    log("starting full HTTPS fetch (this is the stage that hung before) ...")
     t1 = time.perf_counter()
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "egress-probe/1.0"})
@@ -85,10 +102,13 @@ def probe(url):
             result["http_seconds"] = round(time.perf_counter() - t1, 3)
             result["http_status"] = resp.status
             result["bytes_read"] = body_len
+            log(f"HTTP fetch OK in {result['http_seconds']}s, status={resp.status}")
     except Exception as exc:
         result["http_seconds"] = round(time.perf_counter() - t1, 3)
         result["http_error"] = f"{type(exc).__name__}: {exc}"
+        log(f"HTTP fetch FAILED after {result['http_seconds']}s: {result['http_error']}")
 
+    log(f"=== probe done: {url} ===")
     return result
 
 
